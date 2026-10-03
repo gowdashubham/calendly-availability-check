@@ -19,10 +19,12 @@ Note: this uses the same JSON endpoints Calendly's own booking page calls. They 
 not an official API, so if Calendly changes them the run will fail loudly (and the
 workflow sends you a "checker failed" push) rather than silently missing slots.
 """
+import http.client
 import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,17 +55,33 @@ TEST = env("TEST_NOTIFY", "false").lower() in ("1", "true", "yes")
 TZ = ZoneInfo(TZ_NAME)
 
 
-def http_get(url, want_json=True):
+class Transient(Exception):
+    """A temporary hiccup (rate limit, server error, timeout) worth retrying later."""
+
+
+def http_get(url, want_json=True, attempts=4):
     headers = {"User-Agent": UA}
     if want_json:
         headers["Accept"] = "application/json"
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            body = r.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"GET {url} -> HTTP {e.code}") from e
-    return json.loads(body) if want_json else body
+    last = None
+    for i in range(attempts):
+        if i:
+            time.sleep(5 * 2 ** (i - 1))  # 5s, 10s, 20s
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                body = r.read().decode("utf-8", errors="replace")
+            return json.loads(body) if want_json else body
+        except urllib.error.HTTPError as e:
+            if e.code in (408, 425, 429) or e.code >= 500:
+                last = f"HTTP {e.code}"
+                print(f"  attempt {i + 1}: GET {url} -> {last}, retrying")
+                continue
+            raise RuntimeError(f"GET {url} -> HTTP {e.code}") from e
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException, json.JSONDecodeError) as e:
+            last = f"{type(e).__name__}: {e}"
+            print(f"  attempt {i + 1}: GET {url} -> {last}, retrying")
+    raise Transient(f"GET {url} kept failing ({last})")
 
 
 def as_list(obj):
@@ -219,5 +237,30 @@ def main():
     save_state(set(current))
 
 
+FAIL_FILE = os.path.join(os.path.dirname(STATE_FILE) or ".", "failures.txt")
+FAIL_LIMIT = 3  # only report a breakage after this many hiccup runs in a row
+
+
+def failure_count(n=None):
+    if n is None:
+        try:
+            with open(FAIL_FILE) as f:
+                return int(f.read().strip() or 0)
+        except (FileNotFoundError, ValueError):
+            return 0
+    os.makedirs(os.path.dirname(FAIL_FILE) or ".", exist_ok=True)
+    with open(FAIL_FILE, "w") as f:
+        f.write(str(n))
+    return n
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        failure_count(0)
+    except Transient as e:
+        n = failure_count(failure_count() + 1)
+        print(f"::warning::Calendly hiccup ({n} in a row): {e}")
+        if n >= FAIL_LIMIT:
+            sys.exit(f"Calendly has failed {n} runs in a row: {e}")
+        # A one-off blip: stay green; the next run will check again.
