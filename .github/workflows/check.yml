@@ -1,0 +1,63 @@
+name: Check courthouse availability
+
+on:
+  schedule:
+    # Every hour at :07 (cron is UTC; GitHub may run it a few minutes late)
+    - cron: "7 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_notify:
+        description: "Send a test push to my phone"
+        type: boolean
+        default: true
+
+concurrency:
+  group: courthouse-checker
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore memory of slots already announced
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Check Calendly
+        env:
+          CALENDLY_URL: ${{ vars.CALENDLY_URL || 'https://calendly.com/sb-marriages/sb-license-ceremony-eng' }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TARGET_DATES: ${{ vars.TARGET_DATES || '2026-12-16' }}
+          TEST_NOTIFY: ${{ inputs.test_notify || 'false' }}
+        run: python check_calendly.py
+
+      - name: Save memory
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: state-${{ github.run_id }}
+
+      - name: Tell me if the checker breaks
+        if: failure()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl -s \
+            -H "Title: Courthouse checker failed" \
+            -H "Priority: low" \
+            -H "Tags: warning" \
+            -H "Click: $RUN_URL" \
+            -d "The hourly check hit an error. Tap to see the log." \
+            "https://ntfy.sh/$NTFY_TOPIC"
